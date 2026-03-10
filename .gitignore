@@ -1,0 +1,13 @@
+# Environments
+.env
+
+# MacOS
+.DS_Store
+
+# Data files (Personal chat logs)
+*.txt
+data/
+
+# Python
+__pycache__/
+*.py[cod]

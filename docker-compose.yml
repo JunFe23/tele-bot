@@ -1,0 +1,12 @@
+services:
+  ai-bot:
+    build: .
+    container_name: coach-bot
+    restart: always
+    environment:
+      - TELEGRAM_TOKEN=${OPENCLAW_TELEGRAM_TOKEN}
+      - GEMINI_KEY=${OPENCLAW_GEMINI_API_KEY}
+      - ALLOWED_USER=${OPENCLAW_TELEGRAM_ALLOWED_USERS}
+    # [추가] 도커 컨테이너 내부에서 맥북 호스트로 접속하기 위한 설정
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
