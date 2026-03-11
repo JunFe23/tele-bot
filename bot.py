@@ -12,6 +12,10 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER = int(os.getenv("ALLOWED_USER"))
 OLLAMA_URL = "http://host.docker.internal:11434/api/generate"
 
+# 카카오톡 파싱을 위한 이름 (보안을 위해 환경변수 처리. 로컬 .env 에 KAKAOTALK_MY_NAME, KAKAOTALK_FRIEND_NAME 설정)
+MY_NAME = os.getenv("MY_NAME", "나")
+FRIEND_NAME = os.getenv("FRIEND_NAME", "친구")
+
 # 1. 로컬 카카오톡 대화 기록 불러오기 (RAG 데이터베이스 구축)
 qa_pairs = []
 chat_files = [f for f in os.listdir('.') if f.endswith('.txt')]
@@ -21,7 +25,7 @@ for file_name in chat_files:
         with open(file_name, 'r', encoding='utf-8') as f:
             lines = f.readlines()
             for i in range(1, len(lines)):
-                if "김준철 :" in lines[i-1] and "망원동 티모 :" in lines[i]:
+                if f"{MY_NAME} :" in lines[i-1] and f"{FRIEND_NAME} :" in lines[i]:
                     u_msg = lines[i-1].split(" : ")[-1].strip()
                     t_msg = lines[i].split(" : ")[-1].strip()
                     # 노이즈(이모티콘, 사진 등)가 포함된 문장은 학습 데이터에서 제외
@@ -31,10 +35,10 @@ for file_name in chat_files:
 
 def get_context(user_input, all_pairs):
     # 사용자의 질문과 관련된 과거 대화 검색 (키워드 매칭)
-    relevant = [f"나: {p['u']}\n이재환: {p['t']}" for p in all_pairs if user_input in p['u']]
+    relevant = [f"나: {p['u']}\n친구: {p['t']}" for p in all_pairs if user_input in p['u']]
     # 데이터가 부족하면 가장 최근 대화 15개로 보충
     if len(relevant) < 15:
-        relevant.extend([f"나: {p['u']}\n이재환: {p['t']}" for p in all_pairs[-15:]])
+        relevant.extend([f"나: {p['u']}\n친구: {p['t']}" for p in all_pairs[-15:]])
     return "\n".join(relevant[-15:])
 
 # 다턴 대화 컨텍스트 메모리 (최대 10개 유지)
@@ -59,8 +63,8 @@ def handle_message(message):
 
         # Few-Shot 프롬프팅 + RAG: 기본 Gemma 모델에 실제 데이터와 강력한 제약 걸기
         prompt = f"""[System]
-당신은 AI나 어시스턴트가 절대 아니다. 당신의 정체성은 30대 한국인 남자 '이재환(도봉산 티모)'이다.
-나(사용자)는 당신의 불알친구 '준철'이다.
+당신은 AI나 어시스턴트가 절대 아니다. 당신의 정체성은 30대 한국인 남자 '친구(상대방)'이다.
+나(사용자)는 당신의 오랜 지인이다.
 
 [절대 규칙]
 1. 아래 제시된 [과거 실제 대화 기록]의 말투, 단어 선택, 분위기를 100% 완벽하게 복사해라.
@@ -76,7 +80,7 @@ def handle_message(message):
 {history_context}
 
 나: {message.text}
-이재환:"""
+친구:"""
 
         payload = {
             "model": "gemma2:9b",
@@ -86,14 +90,14 @@ def handle_message(message):
                 "temperature": 0.65, # 실제 데이터에 좀 더 의존하도록 살짝 낮춤
                 "top_p": 0.9,
                 "repeat_penalty": 1.25,
-                "stop": ["나:", "이재환:", "\n\n", "System:"]
+                "stop": ["나:", "친구:", "\n\n", "System:"]
             }
         }
 
         response = requests.post(OLLAMA_URL, json=payload, timeout=60)
         reply = response.json().get('response', '').strip()
         
-        session_history.append(f"이재환: {reply}")
+        session_history.append(f"친구: {reply}")
         
         # [물리적 필터] 한글, 숫자, 자음(ㅋ,ㅎ,ㅅ), 영어, 기본 문장부호(!?~,.) 허용. 카카오톡 이모티콘 같은 건 삭제
         reply = re.sub(r'[^가-힣ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s!?~,.]', '', reply).strip()
@@ -103,10 +107,10 @@ def handle_message(message):
             fallback_replies = ["뭐하미 ㅋㅋㅋ", "ㅇㅇ", "그래서어쩔", "ㄹㅇㅋㅋ"]
             reply = random.choice(fallback_replies)
         elif len(reply) > 40:
-            # 티모는 길게 말하지 않음
+            # 봇은 길게 말하지 않음
             reply = reply[:40] + "..."
 
-        print(f"🤖 티모: {reply}", flush=True)
+        print(f"🤖 친구: {reply}", flush=True)
         bot.send_message(message.chat.id, reply)
 
     except Exception as e:
@@ -128,7 +132,7 @@ def proactive_messaging():
             try:
                 print("🔄 선톡 생성 시도 중...", flush=True)
                 # 선톡용 명령어
-                prompt = """당신은 30대 남자 '망원동 이재환(도봉산 티모)'이다.
+                prompt = """당신은 30대 남자 '친구(상대방)'이다.
 사용자에게 아무 이유 없이 빈둥거리면서 심심하다고 선톡(먼저 말 걸기)을 하나 보내봐.
 인사말 쓰지 말고, 뜬금없는 질문을 던지거나 이상한 소리를 해. 무조건 반말로 짧게 쓰고 ㅋㅋㅋ나 ~쓰, ~맨 같은 말투 꼭 써라.
 
@@ -160,7 +164,7 @@ def proactive_messaging():
                     print(f"🔔 선톡 발송: {reply}", flush=True)
                     bot.send_message(ALLOWED_USER, reply)
                     
-                    session_history.append(f"이재환: {reply}")
+                    session_history.append(f"친구: {reply}")
                     if len(session_history) > 10:
                         session_history.pop(0)
 
@@ -170,5 +174,5 @@ def proactive_messaging():
 # 선톡 스레드 백그라운드 실행
 threading.Thread(target=proactive_messaging, daemon=True).start()
 
-print("🚀 티모봇 가동 시작...")
+print("🚀 봇 가동 시작...")
 bot.infinity_polling()
