@@ -10,13 +10,16 @@ from datetime import datetime
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER = int(os.getenv("ALLOWED_USER"))
-OLLAMA_URL = "http://host.docker.internal:11434/api/generate"
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
 
 # 카카오톡 파싱을 위한 이름 (보안을 위해 환경변수 처리. 로컬 .env 에 KAKAOTALK_MY_NAME, KAKAOTALK_FRIEND_NAME 설정)
 MY_NAME = os.getenv("MY_NAME", "나")
 FRIEND_NAME = os.getenv("FRIEND_NAME", "친구")
 
 # 1. 로컬 카카오톡 대화 기록 불러오기 (RAG 데이터베이스 구축)
+# MY_NAME -> FRIEND_NAME 순서와 FRIEND_NAME -> MY_NAME 순서 모두 수집해
+# 친구의 말투(t_msg 또는 u_msg)를 최대한 많이 학습 데이터로 확보
 qa_pairs = []
 chat_files = [f for f in os.listdir('.') if f.endswith('.txt')]
 
@@ -25,21 +28,48 @@ for file_name in chat_files:
         with open(file_name, 'r', encoding='utf-8') as f:
             lines = f.readlines()
             for i in range(1, len(lines)):
-                if f"{MY_NAME} :" in lines[i-1] and f"{FRIEND_NAME} :" in lines[i]:
-                    u_msg = lines[i-1].split(" : ")[-1].strip()
-                    t_msg = lines[i].split(" : ")[-1].strip()
-                    # 노이즈(이모티콘, 사진 등)가 포함된 문장은 학습 데이터에서 제외
-                    if not any(x in t_msg for x in ["사진", "이모티콘", "동영상", "샵검색"]):
+                prev, curr = lines[i-1], lines[i]
+                noise = ["사진", "이모티콘", "동영상", "샵검색"]
+                # 케이스 1: 내가 말하고 -> 친구가 대답 (기존)
+                if f"{MY_NAME} :" in prev and f"{FRIEND_NAME} :" in curr:
+                    u_msg = prev.split(" : ", 1)[-1].strip()
+                    t_msg = curr.split(" : ", 1)[-1].strip()
+                    if not any(x in t_msg for x in noise):
+                        qa_pairs.append({"u": u_msg, "t": t_msg})
+                # 케이스 2: 친구가 먼저 말하고 -> 내가 대답 (친구 선톡 말투 수집)
+                elif f"{FRIEND_NAME} :" in prev and f"{MY_NAME} :" in curr:
+                    t_msg = prev.split(" : ", 1)[-1].strip()  # 친구 말 = 학습 대상
+                    u_msg = curr.split(" : ", 1)[-1].strip()
+                    if not any(x in t_msg for x in noise):
                         qa_pairs.append({"u": u_msg, "t": t_msg})
     except: continue
 
+print(f"✅ 카카오톡 파싱 완료: {len(qa_pairs)}개의 대화 쌍 로드됨", flush=True)
+
 def get_context(user_input, all_pairs):
-    # 사용자의 질문과 관련된 과거 대화 검색 (키워드 매칭)
-    relevant = [f"나: {p['u']}\n친구: {p['t']}" for p in all_pairs if user_input in p['u']]
-    # 데이터가 부족하면 가장 최근 대화 15개로 보충
-    if len(relevant) < 15:
-        relevant.extend([f"나: {p['u']}\n친구: {p['t']}" for p in all_pairs[-15:]])
-    return "\n".join(relevant[-15:])
+    # 입력이 짧아도 (예: ㅎㅇ, ㄹㅌ?) 통째로 검색
+    raw = user_input.strip()
+    keywords = [w for w in raw.split() if len(w) >= 1]
+    if not keywords:
+        keywords = [raw]
+
+    relevant = []
+    for p in all_pairs:
+        if any(k in p['u'] for k in keywords):
+            relevant.append(f"\ub098: {p['u']}\n\uce5c\uad6c: {p['t']}")
+
+    # 최신 15개만 쭬집
+    if len(relevant) > 15:
+        relevant = relevant[-15:]
+
+    # 부족할 경우 최신 대화 보충
+    if len(relevant) < 10:
+        needed = 10 - len(relevant)
+        recent = [f"\ub098: {p['u']}\n\uce5c\uad6c: {p['t']}" for p in all_pairs[-needed:]
+                  if f"\ub098: {p['u']}\n\uce5c\uad6c: {p['t']}" not in relevant]
+        relevant.extend(recent)
+
+    return "\n".join(relevant)
 
 # 다턴 대화 컨텍스트 메모리 (최대 10개 유지)
 session_history = []
@@ -60,45 +90,54 @@ def handle_message(message):
 
         # 과거 실제 대화 기록 검색
         relevant_context = get_context(message.text, qa_pairs)
+        print(f"🔍 [RAG Context] 매칭된 과거 대화 길이: {len(relevant_context)}자", flush=True)
 
-        # Few-Shot 프롬프팅 + RAG: 기본 Gemma 모델에 실제 데이터와 강력한 제약 걸기
-        prompt = f"""[System]
-당신은 AI나 어시스턴트가 절대 아니다. 당신의 정체성은 30대 한국인 남자 '친구(상대방)'이다.
-나(사용자)는 당신의 오랜 지인이다.
+        # --- Gemini Persona Prompt ---
+        history_context = "\n".join(session_history[-6:])  # 최근 6턴만
 
-[절대 규칙]
-1. 아래 제시된 [과거 실제 대화 기록]의 말투, 단어 선택, 분위기를 100% 완벽하게 복사해라.
-2. 기계처럼 친절하게 설명하거나 도와주려고 하지 마라. 친구끼리 카톡하듯이 무심하고 짧게 툭툭 던져라.
-3. 절대 존댓말을 쓰지 마라. 100% 반말만 해라.
-4. "ㅋㅋㅋ"를 자주 쓰고, 기분이 좋거나 장난칠 때 "~맨", "~쓰", "~미" 같은 어미를 섞어 써라.
-5. 무조건 1~2문장으로 끝내라. 지식이나 코딩 질문이 들어와도 정답을 아주 건방지고 짧게 대답해라.
+        prompt = f"""아래 [카톡 대화 예시]는 내가 매일 카톡하는 30대 남자 친구의 실제 대화 데이터다.
+나의 [최근 말] ("대화 흐름" 맨 마지막 "나: " 라인)에 쳤카오톡 친구로서 답장을 보내라.
 
-[과거 실제 대화 기록 (말투 완벽 복사할 것)]
+[금지 사항]
+- 전 세계 AI/챗봇/쥬스누마크 굴지
+- 존댓말 절대 금지 ("왔어요", "감사합니다" 등)
+- [대화 흐름]에 이미 있는 문구를 그대로 도복하거나 어구 반복 금지
+- 2문장 이상 금지
+
+[대화 스타일]
+- [카톡 대화 예시]의 말투("~맨", "~쓰", "~미", "ㅋㅋㅋ" 등)를 자연스럽게 써라
+- "뭐하냐맨", "너나만 툭툭 던져라" 주식으로 짧고 무심하게
+
+[카톡 대화 예시 - 이 말투채 참고해 답해라]
 {relevant_context}
 
-[현재 직전 대화 흐름]
+[대화 흐름]
 {history_context}
 
 나: {message.text}
 친구:"""
 
         payload = {
-            "model": "gemma2:9b",
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.65, # 실제 데이터에 좀 더 의존하도록 살짝 낮춤
-                "top_p": 0.9,
-                "repeat_penalty": 1.25,
-                "stop": ["나:", "친구:", "\n\n", "System:"]
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.8,
+                "topP": 0.95,
+                "maxOutputTokens": 100,
+                "stopSequences": ["나:", "친구:", "\n\n", "System:"]
             }
         }
 
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        reply = response.json().get('response', '').strip()
+        response = requests.post(GEMINI_URL, json=payload, timeout=60).json()
         
-        session_history.append(f"친구: {reply}")
+        # Gemini 응답 파싱
+        try:
+            reply = response['candidates'][0]['content']['parts'][0]['text'].strip()
+        except (KeyError, IndexError):
+            reply = ""
         
+
         # [물리적 필터] 한글, 숫자, 자음(ㅋ,ㅎ,ㅅ), 영어, 기본 문장부호(!?~,.) 허용. 카카오톡 이모티콘 같은 건 삭제
         reply = re.sub(r'[^가-힣ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s!?~,.]', '', reply).strip()
         
@@ -106,9 +145,13 @@ def handle_message(message):
         if not reply or len(reply) < 2 or "와 와 와" in reply or "ㅋㅋㅋ ㅋㅋㅋ ㅋㅋㅋ" in reply:
             fallback_replies = ["뭐하미 ㅋㅋㅋ", "ㅇㅇ", "그래서어쩔", "ㄹㅇㅋㅋ"]
             reply = random.choice(fallback_replies)
-        elif len(reply) > 40:
-            # 봇은 길게 말하지 않음
-            reply = reply[:40] + "..."
+        elif len(reply) > 60:
+            reply = reply[:60]
+
+        # 필터링 후 세션에 저장 (오염된 응답이 다음 프롬프트를 오염시키지 않도록)
+        session_history.append(f"친구: {reply}")
+        if len(session_history) > 12:
+            session_history.pop(0)
 
         print(f"🤖 친구: {reply}", flush=True)
         bot.send_message(message.chat.id, reply)
@@ -144,18 +187,22 @@ def proactive_messaging():
 선톡:"""
                 
                 payload = {
-                    "model": "gemma2:9b",
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                         "temperature": 0.8,
-                         "repeat_penalty": 1.15,
-                         "stop": ["\n\n"]
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.9,
+                        "topP": 0.95,
+                        "maxOutputTokens": 60,
+                        "stopSequences": ["\n\n"]
                     }
                 }
 
-                response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-                reply = response.json().get('response', '').strip()
+                response = requests.post(GEMINI_URL, json=payload, timeout=60).json()
+                try:
+                    reply = response['candidates'][0]['content']['parts'][0]['text'].strip()
+                except (KeyError, IndexError):
+                    reply = ""
                 
                 # 정규식 필터링
                 reply = re.sub(r'[^가-힣ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s!?~,.]', '', reply).strip()
